@@ -354,7 +354,6 @@ fn auth_from_cache(
 }
 
 fn obtain_response(
-    client: &Client<Connector, Body>,
     url: &ServoUrl,
     method: &Method,
     request_headers: &HeaderMap,
@@ -364,7 +363,7 @@ fn obtain_response(
     iters: u32,
     request_id: Option<&str>,
     is_xhr: bool,
-    context: &FetchContext,
+    context: &mut FetchContext,
 ) -> Box<
     dyn Future<
         Item = (HyperResponse<Decoder>, Option<ChromeToDevtoolsControlMsg>),
@@ -453,7 +452,9 @@ fn obtain_response(
     let send_start = precise_time_ms();
 
     Box::new(
-        client
+        context
+            .state
+            .client
             .request(request)
             .and_then(move |res| {
                 let send_end = precise_time_ms();
@@ -501,7 +502,7 @@ pub fn http_fetch(
     authentication_fetch_flag: bool,
     target: Target,
     done_chan: &mut DoneChannel,
-    context: &FetchContext,
+    context: &mut FetchContext,
 ) -> Response {
     // This is a new async fetch, reset the channel we are waiting on
     *done_chan = None;
@@ -691,7 +692,7 @@ pub fn http_redirect_fetch(
     cors_flag: bool,
     target: Target,
     done_chan: &mut DoneChannel,
-    context: &FetchContext,
+    context: &mut FetchContext,
 ) -> Response {
     let mut redirect_end_timer = RedirectEndTimer(Some(context.timing.clone()));
 
@@ -864,7 +865,7 @@ fn http_network_or_cache_fetch(
     authentication_fetch_flag: bool,
     cors_flag: bool,
     done_chan: &mut DoneChannel,
-    context: &FetchContext,
+    context: &mut FetchContext,
 ) -> Response {
     // Step 2
     let mut response: Option<Response> = None;
@@ -1141,7 +1142,7 @@ fn http_network_or_cache_fetch(
     // Decrement the number of pending stores,
     // and set the state to ready to construct,
     // if no stores are pending.
-    fn update_http_cache_state(context: &FetchContext, http_request: &Request) {
+    fn update_http_cache_state(context: &mut FetchContext, http_request: &Request) {
         let (lock, cvar) = {
             let entry_key = CacheKey::new(&http_request);
             let mut state_map = context.state.http_cache_state.lock().unwrap();
@@ -1357,7 +1358,7 @@ fn http_network_fetch(
     request: &Request,
     credentials_flag: bool,
     done_chan: &mut DoneChannel,
-    context: &FetchContext,
+    context: &mut FetchContext,
 ) -> Response {
     let mut response_end_timer = ResponseEndTimer(Some(context.timing.clone()));
 
@@ -1393,7 +1394,6 @@ fn http_network_fetch(
     // since things like image fetches are classified differently by devtools
     let is_xhr = request.destination == Destination::None;
     let response_future = obtain_response(
-        &context.state.client,
         &url,
         &request.method,
         &request.headers,
@@ -1623,7 +1623,7 @@ fn http_network_fetch(
 fn cors_preflight_fetch(
     request: &Request,
     cache: &mut CorsCache,
-    context: &FetchContext,
+    context: &mut FetchContext,
 ) -> Response {
     // Step 1
     let mut preflight = RequestBuilder::new(request.current_url())

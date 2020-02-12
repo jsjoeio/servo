@@ -4,7 +4,7 @@
 
 use crate::data_loader::decode;
 use crate::fetch::cors_cache::CorsCache;
-use crate::filemanager_thread::{FileManager, FILE_CHUNK_SIZE};
+use crate::filemanager_thread::{FileManagerHandle, FILE_CHUNK_SIZE};
 use crate::http_loader::{determine_request_referrer, http_fetch, HttpState};
 use crate::http_loader::{set_default_accept, set_default_accept_language};
 use crate::subresource_integrity::is_response_integrity_valid;
@@ -17,7 +17,7 @@ use hyper::Method;
 use hyper::StatusCode;
 use ipc_channel::ipc::IpcReceiver;
 use mime::{self, Mime};
-use net_traits::blob_url_store::{parse_blob_url, BlobURLStoreError};
+use net_traits::blob_url_store::BlobURLStoreError;
 use net_traits::filemanager_thread::RelativePos;
 use net_traits::request::{
     is_cors_safelisted_method, is_cors_safelisted_request_header, Origin, ResponseTainting, Window,
@@ -55,7 +55,7 @@ pub struct FetchContext {
     pub state: Arc<HttpState>,
     pub user_agent: Cow<'static, str>,
     pub devtools_chan: Option<Sender<DevtoolsControlMsg>>,
-    pub filemanager: FileManager,
+    pub filemanager: FileManagerHandle,
     pub cancellation_listener: Arc<Mutex<CancellationListener>>,
     pub timing: ServoArc<Mutex<ResourceFetchTiming>>,
 }
@@ -91,7 +91,7 @@ impl CancellationListener {
 pub type DoneChannel = Option<(Sender<Data>, Receiver<Data>)>;
 
 /// [Fetch](https://fetch.spec.whatwg.org#concept-fetch)
-pub fn fetch(request: &mut Request, target: Target, context: &FetchContext) {
+pub fn fetch(request: &mut Request, target: Target, context: &mut FetchContext) {
     // Steps 7,4 of https://w3c.github.io/resource-timing/#processing-model
     // rev order okay since spec says they're equal - https://w3c.github.io/resource-timing/#dfn-starttime
     context
@@ -112,7 +112,7 @@ pub fn fetch_with_cors_cache(
     request: &mut Request,
     cache: &mut CorsCache,
     target: Target,
-    context: &FetchContext,
+    context: &mut FetchContext,
 ) {
     // Step 1.
     if request.window == Window::Client {
@@ -145,7 +145,7 @@ pub fn fetch_with_cors_cache(
     }
 
     // Step 8.
-    main_fetch(request, cache, false, false, target, &mut None, &context);
+    main_fetch(request, cache, false, false, target, &mut None, context);
 }
 
 /// https://www.w3.org/TR/CSP/#should-block-request
@@ -180,7 +180,7 @@ pub fn main_fetch(
     recursive_flag: bool,
     target: Target,
     done_chan: &mut DoneChannel,
-    context: &FetchContext,
+    context: &mut FetchContext,
 ) -> Response {
     // Step 1.
     let mut response = None;
@@ -608,7 +608,7 @@ fn scheme_fetch(
     cache: &mut CorsCache,
     target: Target,
     done_chan: &mut DoneChannel,
-    context: &FetchContext,
+    context: &mut FetchContext,
 ) -> Response {
     let url = request.current_url();
 
@@ -735,15 +735,6 @@ fn scheme_fetch(
             // the length of the data backing the blob.
             let range = get_range_request_bounds(range_header);
 
-            let (id, origin) = match parse_blob_url(&url) {
-                Ok((id, origin)) => (id, origin),
-                Err(()) => {
-                    return Response::network_error(NetworkError::Internal(
-                        "Invalid blob url".into(),
-                    ));
-                },
-            };
-
             let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
             response.status = Some((StatusCode::OK, "OK".to_string()));
             response.raw_status = Some((StatusCode::OK.as_u16(), b"OK".to_vec()));
@@ -755,13 +746,10 @@ fn scheme_fetch(
             let (done_sender, done_receiver) = unbounded();
             *done_chan = Some((done_sender.clone(), done_receiver));
             *response.body.lock().unwrap() = ResponseBody::Receiving(vec![]);
-            let check_url_validity = true;
+
             if let Err(err) = context.filemanager.fetch_file(
                 &done_sender,
                 context.cancellation_listener.clone(),
-                id,
-                check_url_validity,
-                origin,
                 &mut response,
                 range,
             ) {

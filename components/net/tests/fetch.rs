@@ -25,7 +25,7 @@ use msg::constellation_msg::TEST_PIPELINE_ID;
 use net::connector::{create_tls_config, ALPN_H2_H1};
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, CancellationListener, FetchContext};
-use net::filemanager_thread::FileManager;
+use net::filemanager_thread::{FileImpl, FileManager, FileManagerHandle};
 use net::hsts::HstsEntry;
 use net::test::HttpState;
 use net_traits::request::{
@@ -154,8 +154,6 @@ fn test_fetch_blob() {
         }
     }
 
-    let context = new_fetch_context(None, None, None);
-
     let bytes = b"content";
     let blob_buf = BlobBuf {
         filename: Some("test.txt".into()),
@@ -167,9 +165,9 @@ fn test_fetch_blob() {
     let origin = ServoUrl::parse("http://www.example.org/").unwrap();
 
     let id = Uuid::new_v4();
-    context
-        .filemanager
-        .promote_memory(id.clone(), blob_buf, true, "http://www.example.org".into());
+
+    let mut context = new_fetch_context(None, None, None, Some(FileImpl::Memory(blob_buf)));
+
     let url = ServoUrl::parse(&format!("blob:{}{}", origin.as_str(), id.to_simple())).unwrap();
 
     let mut request = Request::new(url, Some(Origin::Origin(origin.origin())), None);
@@ -182,7 +180,7 @@ fn test_fetch_blob() {
         expected: bytes.to_vec(),
     };
 
-    methods::fetch(&mut request, &mut target, &context);
+    methods::fetch(&mut request, &mut target, &mut context);
 
     let fetch_response = receiver.recv().unwrap();
     assert!(!fetch_response.is_network_error());
@@ -220,7 +218,7 @@ fn test_file() {
         .build()
         .unwrap();
     let pool_handle = Arc::new(pool);
-    let mut context = new_fetch_context(None, None, Some(Arc::downgrade(&pool_handle)));
+    let mut context = new_fetch_context(None, None, Some(Arc::downgrade(&pool_handle)), None);
     let fetch_response = fetch_with_context(&mut request, &mut context);
 
     // We should see an opaque-filtered response.
@@ -684,7 +682,10 @@ fn test_fetch_with_hsts() {
         state: Arc::new(HttpState::new(tls_config)),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
-        filemanager: FileManager::new(create_embedder_proxy(), Weak::new()),
+        filemanager: FileManagerHandle::new(
+            FileManager::new(create_embedder_proxy(), Weak::new()),
+            None,
+        ),
         cancellation_listener: Arc::new(Mutex::new(CancellationListener::new(None))),
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,
@@ -736,7 +737,10 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         state: Arc::new(HttpState::new(tls_config)),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
-        filemanager: FileManager::new(create_embedder_proxy(), Weak::new()),
+        filemanager: FileManagerHandle::new(
+            FileManager::new(create_embedder_proxy(), Weak::new()),
+            None,
+        ),
         cancellation_listener: Arc::new(Mutex::new(CancellationListener::new(None))),
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
             ResourceTimingType::Navigation,

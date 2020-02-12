@@ -9,7 +9,7 @@ use crate::cookie;
 use crate::cookie_storage::CookieStorage;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::methods::{fetch, CancellationListener, FetchContext};
-use crate::filemanager_thread::FileManager;
+use crate::filemanager_thread::{FileManager, FileManagerHandle};
 use crate::hsts::HstsList;
 use crate::http_cache::HttpCache;
 use crate::http_loader::{http_redirect_fetch, HttpState, HANDLE};
@@ -22,6 +22,7 @@ use embedder_traits::EmbedderProxy;
 use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcReceiver, IpcReceiverSet, IpcSender};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use net_traits::blob_url_store::parse_blob_url;
 use net_traits::request::{Destination, RequestBuilder};
 use net_traits::response::{Response, ResponseInit};
 use net_traits::storage_thread::StorageThreadMsg;
@@ -503,22 +504,36 @@ impl CoreResourceManager {
             _ => ResourceTimingType::Resource,
         };
 
+        let mut request = request_builder.build();
+        let url = request.current_url();
+
+        let file_impl_id = match url.scheme() {
+            "blob" => parse_blob_url(&url).ok(),
+            _ => None,
+        };
+
+        let file_impl = match file_impl_id {
+            Some((id, origin)) => filemanager.get_file(&id, &origin),
+            None => None,
+        };
+
+        let filemanager_handle = FileManagerHandle::new(filemanager, file_impl);
+
         let thread_pool = match self.thread_pool.as_ref() {
             None => panic!("CoreResourceManager doesn't have a thread-pool."),
             Some(thread_pool) => thread_pool,
         };
 
         thread_pool.spawn(move || {
-            let mut request = request_builder.build();
             // XXXManishearth: Check origin against pipeline id (also ensure that the mode is allowed)
             // todo load context / mimesniff in fetch
             // todo referrer policy?
             // todo service worker stuff
-            let context = FetchContext {
+            let mut context = FetchContext {
                 state: http_state,
                 user_agent: ua,
                 devtools_chan: dc,
-                filemanager: filemanager,
+                filemanager: filemanager_handle,
                 cancellation_listener: Arc::new(Mutex::new(CancellationListener::new(cancel_chan))),
                 timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(request.timing_type()))),
             };
@@ -533,10 +548,10 @@ impl CoreResourceManager {
                         true,
                         &mut sender,
                         &mut None,
-                        &context,
+                        &mut context,
                     );
                 },
-                None => fetch(&mut request, &mut sender, &context),
+                None => fetch(&mut request, &mut sender, &mut context),
             };
         });
     }

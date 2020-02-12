@@ -48,7 +48,7 @@ struct FileStoreEntry {
 }
 
 #[derive(Clone)]
-struct FileMetaData {
+pub struct FileMetaData {
     path: PathBuf,
     /// Modified time in UNIX Epoch format
     modified: u64,
@@ -57,7 +57,7 @@ struct FileMetaData {
 
 /// File backend implementation
 #[derive(Clone)]
-enum FileImpl {
+pub enum FileImpl {
     /// Metadata of on-disk file
     MetaDataOnly(FileMetaData),
     /// In-memory Blob buffer object
@@ -65,6 +65,143 @@ enum FileImpl {
     /// A reference to parent entry in `FileManagerStore`,
     /// representing a sliced version of the parent entry data
     Sliced(Uuid, RelativePos),
+}
+
+pub struct FileManagerHandle {
+    filemanager: FileManager,
+    /// Set to a file-impl when fetching a Blob url.
+    file_impl: Option<FileImpl>,
+}
+
+impl FileManagerHandle {
+    pub fn new(filemanager: FileManager, file_impl: Option<FileImpl>) -> FileManagerHandle {
+        FileManagerHandle {
+            filemanager,
+            file_impl,
+        }
+    }
+
+    // Read a file for the Fetch implementation.
+    pub fn fetch_file(
+        &mut self,
+        done_sender: &Sender<Data>,
+        cancellation_listener: Arc<Mutex<CancellationListener>>,
+        response: &mut Response,
+        range: RangeRequestBounds,
+    ) -> Result<(), BlobURLStoreError> {
+        self.fetch_blob_buf(done_sender, cancellation_listener, range, response)
+    }
+
+    pub fn fetch_file_in_chunks(
+        &mut self,
+        done_sender: Sender<Data>,
+        reader: BufReader<File>,
+        res_body: ServoArc<Mutex<ResponseBody>>,
+        cancellation_listener: Arc<Mutex<CancellationListener>>,
+        range: RelativePos,
+    ) {
+        self.filemanager.fetch_file_in_chunks(
+            done_sender,
+            reader,
+            res_body,
+            cancellation_listener,
+            range,
+        );
+    }
+
+    pub fn promote_memory(&self, id: Uuid, blob_buf: BlobBuf, set_valid: bool, origin: FileOrigin) {
+        self.filemanager
+            .promote_memory(id, blob_buf, set_valid, origin);
+    }
+
+    fn fetch_blob_buf(
+        &mut self,
+        done_sender: &Sender<Data>,
+        cancellation_listener: Arc<Mutex<CancellationListener>>,
+        range: RangeRequestBounds,
+        response: &mut Response,
+    ) -> Result<(), BlobURLStoreError> {
+        match self.file_impl.take() {
+            Some(FileImpl::Memory(buf)) => {
+                let range = match range.get_final(Some(buf.size)) {
+                    Ok(range) => range,
+                    Err(_) => {
+                        return Err(BlobURLStoreError::InvalidRange);
+                    },
+                };
+
+                let range = range.to_abs_range(buf.size as usize);
+                let len = range.len() as u64;
+
+                set_headers(
+                    &mut response.headers,
+                    len,
+                    buf.type_string.parse().unwrap_or(mime::TEXT_PLAIN),
+                    /* filename */ None,
+                );
+
+                let mut bytes = vec![];
+                bytes.extend_from_slice(buf.bytes.index(range));
+
+                let _ = done_sender.send(Data::Payload(bytes));
+                let _ = done_sender.send(Data::Done);
+
+                Ok(())
+            },
+            Some(FileImpl::MetaDataOnly(metadata)) => {
+                /* XXX: Snapshot state check (optional) https://w3c.github.io/FileAPI/#snapshot-state.
+                        Concretely, here we create another file, and this file might not
+                        has the same underlying file state (meta-info plus content) as the time
+                        create_entry is called.
+                */
+
+                let file = File::open(&metadata.path)
+                    .map_err(|e| BlobURLStoreError::External(e.to_string()))?;
+
+                let range = match range.get_final(Some(metadata.size)) {
+                    Ok(range) => range,
+                    Err(_) => {
+                        return Err(BlobURLStoreError::InvalidRange);
+                    },
+                };
+
+                let mut reader = BufReader::with_capacity(FILE_CHUNK_SIZE, file);
+                if reader.seek(SeekFrom::Start(range.start as u64)).is_err() {
+                    return Err(BlobURLStoreError::External(
+                        "Unexpected method for blob".into(),
+                    ));
+                }
+
+                let filename = metadata
+                    .path
+                    .file_name()
+                    .and_then(|osstr| osstr.to_str())
+                    .map(|s| s.to_string());
+
+                set_headers(
+                    &mut response.headers,
+                    metadata.size,
+                    mime_guess::from_path(metadata.path)
+                        .first()
+                        .unwrap_or(mime::TEXT_PLAIN),
+                    filename,
+                );
+
+                self.filemanager.fetch_file_in_chunks(
+                    done_sender.clone(),
+                    reader,
+                    response.body.clone(),
+                    cancellation_listener,
+                    range,
+                );
+
+                Ok(())
+            },
+            Some(FileImpl::Sliced(_, _)) | None => {
+                panic!("Attempt to use FileManagerHandle with sliced, or non-existent, file-impl.")
+            },
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -83,6 +220,10 @@ impl FileManager {
         }
     }
 
+    pub fn get_file(&self, id: &Uuid, origin_in: &FileOrigin) -> Option<FileImpl> {
+        self.store.get_impl(id, origin_in, true).ok()
+    }
+
     pub fn read_file(
         &self,
         sender: IpcSender<FileManagerResult<ReadFileProgress>>,
@@ -99,30 +240,6 @@ impl FileManager {
             });
             Some(())
         });
-    }
-
-    // Read a file for the Fetch implementation.
-    // It gets the required headers synchronously and reads the actual content
-    // in a separate thread.
-    pub fn fetch_file(
-        &self,
-        done_sender: &Sender<Data>,
-        cancellation_listener: Arc<Mutex<CancellationListener>>,
-        id: Uuid,
-        check_url_validity: bool,
-        origin: FileOrigin,
-        response: &mut Response,
-        range: RangeRequestBounds,
-    ) -> Result<(), BlobURLStoreError> {
-        self.fetch_blob_buf(
-            done_sender,
-            cancellation_listener,
-            &id,
-            &origin,
-            range,
-            check_url_validity,
-            response,
-        )
     }
 
     pub fn promote_memory(&self, id: Uuid, blob_buf: BlobBuf, set_valid: bool, origin: FileOrigin) {
@@ -246,111 +363,6 @@ impl FileManager {
             .unwrap_or_else(|| {
                 let _ = done_sender_clone.send(Data::Cancelled);
             });
-    }
-
-    fn fetch_blob_buf(
-        &self,
-        done_sender: &Sender<Data>,
-        cancellation_listener: Arc<Mutex<CancellationListener>>,
-        id: &Uuid,
-        origin_in: &FileOrigin,
-        range: RangeRequestBounds,
-        check_url_validity: bool,
-        response: &mut Response,
-    ) -> Result<(), BlobURLStoreError> {
-        let file_impl = self.store.get_impl(id, origin_in, check_url_validity)?;
-        match file_impl {
-            FileImpl::Memory(buf) => {
-                let range = match range.get_final(Some(buf.size)) {
-                    Ok(range) => range,
-                    Err(_) => {
-                        return Err(BlobURLStoreError::InvalidRange);
-                    },
-                };
-
-                let range = range.to_abs_range(buf.size as usize);
-                let len = range.len() as u64;
-
-                set_headers(
-                    &mut response.headers,
-                    len,
-                    buf.type_string.parse().unwrap_or(mime::TEXT_PLAIN),
-                    /* filename */ None,
-                );
-
-                let mut bytes = vec![];
-                bytes.extend_from_slice(buf.bytes.index(range));
-
-                let _ = done_sender.send(Data::Payload(bytes));
-                let _ = done_sender.send(Data::Done);
-
-                Ok(())
-            },
-            FileImpl::MetaDataOnly(metadata) => {
-                /* XXX: Snapshot state check (optional) https://w3c.github.io/FileAPI/#snapshot-state.
-                        Concretely, here we create another file, and this file might not
-                        has the same underlying file state (meta-info plus content) as the time
-                        create_entry is called.
-                */
-
-                let file = File::open(&metadata.path)
-                    .map_err(|e| BlobURLStoreError::External(e.to_string()))?;
-
-                let range = match range.get_final(Some(metadata.size)) {
-                    Ok(range) => range,
-                    Err(_) => {
-                        return Err(BlobURLStoreError::InvalidRange);
-                    },
-                };
-
-                let mut reader = BufReader::with_capacity(FILE_CHUNK_SIZE, file);
-                if reader.seek(SeekFrom::Start(range.start as u64)).is_err() {
-                    return Err(BlobURLStoreError::External(
-                        "Unexpected method for blob".into(),
-                    ));
-                }
-
-                let filename = metadata
-                    .path
-                    .file_name()
-                    .and_then(|osstr| osstr.to_str())
-                    .map(|s| s.to_string());
-
-                set_headers(
-                    &mut response.headers,
-                    metadata.size,
-                    mime_guess::from_path(metadata.path)
-                        .first()
-                        .unwrap_or(mime::TEXT_PLAIN),
-                    filename,
-                );
-
-                self.fetch_file_in_chunks(
-                    done_sender.clone(),
-                    reader,
-                    response.body.clone(),
-                    cancellation_listener,
-                    range,
-                );
-
-                Ok(())
-            },
-            FileImpl::Sliced(parent_id, inner_rel_pos) => {
-                // Next time we don't need to check validity since
-                // we have already done that for requesting URL if necessary.
-                return self.fetch_blob_buf(
-                    done_sender,
-                    cancellation_listener,
-                    &parent_id,
-                    origin_in,
-                    RangeRequestBounds::Final(
-                        RelativePos::full_range().slice_inner(&inner_rel_pos),
-                    ),
-                    false,
-                    response,
-                );
-            },
-        }
     }
 }
 
