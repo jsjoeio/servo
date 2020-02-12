@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use crate::fetch::methods::{CancellationListener, Data, RangeRequestBounds};
+use crate::resource_thread::CoreResourceThreadPool;
 use crossbeam_channel::Sender;
 use embedder_traits::{EmbedderMsg, EmbedderProxy, FilterPattern};
 use headers::{ContentLength, ContentType, HeaderMap, HeaderMapExt};
@@ -208,11 +209,14 @@ impl FileManagerHandle {
 pub struct FileManager {
     embedder_proxy: EmbedderProxy,
     store: Arc<FileManagerStore>,
-    thread_pool: Weak<rayon::ThreadPool>,
+    thread_pool: Weak<CoreResourceThreadPool>,
 }
 
 impl FileManager {
-    pub fn new(embedder_proxy: EmbedderProxy, pool_handle: Weak<rayon::ThreadPool>) -> FileManager {
+    pub fn new(
+        embedder_proxy: EmbedderProxy,
+        pool_handle: Weak<CoreResourceThreadPool>,
+    ) -> FileManager {
         FileManager {
             embedder_proxy: embedder_proxy,
             store: Arc::new(FileManagerStore::new()),

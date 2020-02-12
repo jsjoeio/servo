@@ -6,6 +6,7 @@ use crate::create_embedder_proxy;
 use embedder_traits::FilterPattern;
 use ipc_channel::ipc;
 use net::filemanager_thread::FileManager;
+use net::resource_thread::CoreResourceThreadPool;
 use net_traits::blob_url_store::BlobURLStoreError;
 use net_traits::filemanager_thread::{
     FileManagerThreadError, FileManagerThreadMsg, ReadFileProgress,
@@ -18,10 +19,7 @@ use std::sync::Arc;
 
 #[test]
 fn test_filemanager() {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .unwrap();
+    let pool = CoreResourceThreadPool::new();
     let pool_handle = Arc::new(pool);
     let filemanager = FileManager::new(create_embedder_proxy(), Arc::downgrade(&pool_handle));
     set_pref!(dom.testing.html_input_element.select_files.enabled, true);

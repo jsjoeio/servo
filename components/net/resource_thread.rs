@@ -45,8 +45,10 @@ use std::fs::{self, File};
 use std::io::prelude::*;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use std::time::Duration;
 
 /// Returns a tuple of (public, private) senders to the new threads.
 pub fn new_resource_threads(
@@ -431,8 +433,59 @@ pub struct CoreResourceManager {
     devtools_chan: Option<Sender<DevtoolsControlMsg>>,
     swmanager_chan: Option<IpcSender<CustomResponseMediator>>,
     filemanager: FileManager,
-    thread_pool: Option<Arc<rayon::ThreadPool>>,
+    thread_pool: Option<Arc<CoreResourceThreadPool>>,
     certificate_path: Option<String>,
+}
+
+// Threadpool used by Fetch and file operations.
+pub struct CoreResourceThreadPool {
+    pool: Arc<rayon::ThreadPool>,
+    busy_workers: Arc<AtomicUsize>,
+    active: AtomicBool,
+}
+
+impl CoreResourceThreadPool {
+    pub fn new() -> CoreResourceThreadPool {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .unwrap();
+        let busy_workers = AtomicUsize::new(0);
+        CoreResourceThreadPool {
+            pool: Arc::new(pool),
+            busy_workers: Arc::new(busy_workers),
+            active: AtomicBool::new(true),
+        }
+    }
+
+    // Spawn work on the thread-pool.
+    pub fn spawn<OP>(&self, work: OP)
+    where
+        OP: FnOnce() + Send + 'static,
+    {
+        if !self.active.load(Ordering::SeqCst) {
+            return;
+        }
+        let busy_workers = self.busy_workers.clone();
+        self.pool.spawn(move || {
+            busy_workers.fetch_add(1, Ordering::SeqCst);
+            work();
+            busy_workers.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
+    // Wait until all workers are done.
+    pub fn exit(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        let mut rounds = 0;
+        while !(self.busy_workers.load(Ordering::SeqCst) == 0) {
+            rounds += 1;
+            if rounds == 10 {
+                return debug!("Failed to exit all CoreResource workers within one sec.");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 impl CoreResourceManager {
@@ -443,10 +496,7 @@ impl CoreResourceManager {
         embedder_proxy: EmbedderProxy,
         certificate_path: Option<String>,
     ) -> CoreResourceManager {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(16)
-            .build()
-            .unwrap();
+        let pool = CoreResourceThreadPool::new();
         let pool_handle = Arc::new(pool);
         CoreResourceManager {
             user_agent: user_agent,
@@ -459,18 +509,20 @@ impl CoreResourceManager {
     }
 
     pub fn exit(&mut self) {
-        // Note: this terminates the thread-pool,
-        // but it doesn't actually stop any running thread.
-        //
-        // TODO: ensure all workers thread have exited?
-        let pool = self
+        let pool_handle = self
             .thread_pool
             .take()
             .expect("CoreResourceManager doesn't have a thread-pool.");
-        drop(
-            Arc::try_unwrap(pool)
-                .expect("More than one strong ref to CoreResourceManager thread-pool."),
-        );
+
+        let pool = match Arc::try_unwrap(pool_handle) {
+            Ok(pool) => pool,
+            Err(_) => panic!("More than one strong ref to CoreResourceManager thread-pool."),
+        };
+
+        // Wait until all workers are done.
+        pool.exit();
+
+        debug!("Exited CoreResourceManager");
     }
 
     fn set_cookie_for_url(

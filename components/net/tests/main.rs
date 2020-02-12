@@ -33,6 +33,7 @@ use net::connector::{create_tls_config, ALPN_H2_H1};
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, CancellationListener, FetchContext};
 use net::filemanager_thread::{FileImpl, FileManager, FileManagerHandle};
+use net::resource_thread::CoreResourceThreadPool;
 use net::test::HttpState;
 use net_traits::request::Request;
 use net_traits::response::Response;
@@ -86,7 +87,7 @@ fn create_embedder_proxy() -> EmbedderProxy {
 fn new_fetch_context(
     dc: Option<Sender<DevtoolsControlMsg>>,
     fc: Option<EmbedderProxy>,
-    pool_handle: Option<Weak<rayon::ThreadPool>>,
+    pool_handle: Option<Weak<CoreResourceThreadPool>>,
     file_impl: Option<FileImpl>,
 ) -> FetchContext {
     let certs = resources::read_string(Resource::SSLCertificates);

@@ -27,6 +27,7 @@ use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, CancellationListener, FetchContext};
 use net::filemanager_thread::{FileImpl, FileManager, FileManagerHandle};
 use net::hsts::HstsEntry;
+use net::resource_thread::CoreResourceThreadPool;
 use net::test::HttpState;
 use net_traits::request::{
     Destination, Origin, RedirectMode, Referrer, Request, RequestBuilder, RequestMode,
@@ -213,10 +214,7 @@ fn test_file() {
     let origin = Origin::Origin(url.origin());
     let mut request = Request::new(url, Some(origin), None);
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .unwrap();
+    let pool = CoreResourceThreadPool::new();
     let pool_handle = Arc::new(pool);
     let mut context = new_fetch_context(None, None, Some(Arc::downgrade(&pool_handle)), None);
     let fetch_response = fetch_with_context(&mut request, &mut context);
