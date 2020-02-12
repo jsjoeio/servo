@@ -515,13 +515,8 @@ impl CoreResourceManager {
             .take()
             .expect("CoreResourceManager doesn't have a thread-pool.");
 
-        let pool = match Arc::try_unwrap(pool_handle) {
-            Ok(pool) => pool,
-            Err(_) => panic!("More than one strong ref to CoreResourceManager thread-pool."),
-        };
-
         // Wait until all workers are done.
-        pool.exit();
+        pool_handle.exit();
 
         debug!("Exited CoreResourceManager");
     }
