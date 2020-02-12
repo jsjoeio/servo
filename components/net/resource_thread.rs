@@ -8,8 +8,8 @@ use crate::connector::{create_http_client, create_tls_config, ALPN_H2_H1};
 use crate::cookie;
 use crate::cookie_storage::CookieStorage;
 use crate::fetch::cors_cache::CorsCache;
-use crate::fetch::methods::{fetch, CancellationListener, FetchContext};
-use crate::filemanager_thread::FileManager;
+use crate::fetch::methods::{fetch, CancellationListener, FetchContext, RangeRequestBounds};
+use crate::filemanager_thread::{FileImpl, FileManager, FileManagerHandle};
 use crate::hsts::HstsList;
 use crate::http_cache::HttpCache;
 use crate::http_loader::{http_redirect_fetch, HttpState, HANDLE};
@@ -22,6 +22,8 @@ use embedder_traits::EmbedderProxy;
 use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcReceiver, IpcReceiverSet, IpcSender};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use net_traits::blob_url_store::parse_blob_url;
+use net_traits::filemanager_thread::RelativePos;
 use net_traits::request::{Destination, RequestBuilder};
 use net_traits::response::{Response, ResponseInit};
 use net_traits::storage_thread::StorageThreadMsg;
@@ -44,8 +46,10 @@ use std::fs::{self, File};
 use std::io::prelude::*;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use std::time::Duration;
 
 /// Returns a tuple of (public, private) senders to the new threads.
 pub fn new_resource_threads(
@@ -345,6 +349,7 @@ impl ResourceChannelManager {
                         Err(_) => warn!("Error writing hsts list to disk"),
                     }
                 }
+                self.resource_manager.exit();
                 let _ = sender.send(());
                 return false;
             },
@@ -429,8 +434,59 @@ pub struct CoreResourceManager {
     devtools_chan: Option<Sender<DevtoolsControlMsg>>,
     swmanager_chan: Option<IpcSender<CustomResponseMediator>>,
     filemanager: FileManager,
-    fetch_pool: rayon::ThreadPool,
+    thread_pool: Option<Arc<CoreResourceThreadPool>>,
     certificate_path: Option<String>,
+}
+
+// Threadpool used by Fetch and file operations.
+pub struct CoreResourceThreadPool {
+    pool: Arc<rayon::ThreadPool>,
+    busy_workers: Arc<AtomicUsize>,
+    active: AtomicBool,
+}
+
+impl CoreResourceThreadPool {
+    pub fn new() -> CoreResourceThreadPool {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .unwrap();
+        let busy_workers = AtomicUsize::new(0);
+        CoreResourceThreadPool {
+            pool: Arc::new(pool),
+            busy_workers: Arc::new(busy_workers),
+            active: AtomicBool::new(true),
+        }
+    }
+
+    // Spawn work on the thread-pool.
+    pub fn spawn<OP>(&self, work: OP)
+    where
+        OP: FnOnce() + Send + 'static,
+    {
+        if !self.active.load(Ordering::SeqCst) {
+            return;
+        }
+        let busy_workers = self.busy_workers.clone();
+        self.pool.spawn(move || {
+            busy_workers.fetch_add(1, Ordering::SeqCst);
+            work();
+            busy_workers.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
+    // Wait until all workers are done.
+    pub fn exit(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        let mut rounds = 0;
+        while !(self.busy_workers.load(Ordering::SeqCst) == 0) {
+            rounds += 1;
+            if rounds == 10 {
+                return debug!("Failed to exit all CoreResource workers within one sec.");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 impl CoreResourceManager {
@@ -441,18 +497,28 @@ impl CoreResourceManager {
         embedder_proxy: EmbedderProxy,
         certificate_path: Option<String>,
     ) -> CoreResourceManager {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(16)
-            .build()
-            .unwrap();
+        let pool = CoreResourceThreadPool::new();
+        let pool_handle = Arc::new(pool);
         CoreResourceManager {
             user_agent: user_agent,
             devtools_chan: devtools_channel,
             swmanager_chan: None,
-            filemanager: FileManager::new(embedder_proxy),
-            fetch_pool: pool,
+            filemanager: FileManager::new(embedder_proxy, Arc::downgrade(&pool_handle)),
+            thread_pool: Some(pool_handle),
             certificate_path,
         }
+    }
+
+    pub fn exit(&mut self) {
+        let pool_handle = self
+            .thread_pool
+            .take()
+            .expect("CoreResourceManager doesn't have a thread-pool.");
+
+        // Wait until all workers are done.
+        pool_handle.exit();
+
+        debug!("Exited CoreResourceManager");
     }
 
     fn set_cookie_for_url(
@@ -486,17 +552,55 @@ impl CoreResourceManager {
             _ => ResourceTimingType::Resource,
         };
 
-        self.fetch_pool.spawn(move || {
-            let mut request = request_builder.build();
+        let mut request = request_builder.build();
+        let url = request.current_url();
+
+        let file_impl_id = match url.scheme() {
+            "blob" => parse_blob_url(&url).ok(),
+            _ => None,
+        };
+
+        let file_impl = match file_impl_id.as_ref() {
+            Some((id, origin)) => filemanager.get_file(id, origin),
+            None => None,
+        };
+
+        let (file_impl, range) = match file_impl {
+            None => (None, None),
+            Some(FileImpl::Sliced(parent_id, inner_rel_pos)) => {
+                let origin = file_impl_id
+                    .expect("Sliced file-impl doesn't have an id.")
+                    .1;
+                match filemanager.get_file(&parent_id, &origin) {
+                    None => (None, None),
+                    Some(parent) => {
+                        let range = RangeRequestBounds::Final(
+                            RelativePos::full_range().slice_inner(&inner_rel_pos),
+                        );
+                        (Some(parent), Some(range))
+                    },
+                }
+            },
+            Some(file) => (Some(file), None),
+        };
+
+        let filemanager_handle = FileManagerHandle::new(filemanager, file_impl, range);
+
+        let thread_pool = match self.thread_pool.as_ref() {
+            None => panic!("CoreResourceManager doesn't have a thread-pool."),
+            Some(thread_pool) => thread_pool,
+        };
+
+        thread_pool.spawn(move || {
             // XXXManishearth: Check origin against pipeline id (also ensure that the mode is allowed)
             // todo load context / mimesniff in fetch
             // todo referrer policy?
             // todo service worker stuff
-            let context = FetchContext {
+            let mut context = FetchContext {
                 state: http_state,
                 user_agent: ua,
                 devtools_chan: dc,
-                filemanager: filemanager,
+                filemanager: filemanager_handle,
                 cancellation_listener: Arc::new(Mutex::new(CancellationListener::new(cancel_chan))),
                 timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(request.timing_type()))),
             };
@@ -511,10 +615,10 @@ impl CoreResourceManager {
                         true,
                         &mut sender,
                         &mut None,
-                        &context,
+                        &mut context,
                     );
                 },
-                None => fetch(&mut request, &mut sender, &context),
+                None => fetch(&mut request, &mut sender, &mut context),
             };
         });
     }
