@@ -31,7 +31,7 @@ use hyper::service::service_fn_ok;
 use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
 use net::connector::{create_tls_config, ALPN_H2_H1};
 use net::fetch::cors_cache::CorsCache;
-use net::fetch::methods::{self, CancellationListener, FetchContext};
+use net::fetch::methods::{self, CancellationListener, FetchContext, RangeRequestBounds};
 use net::filemanager_thread::{FileImpl, FileManager, FileManagerHandle};
 use net::resource_thread::CoreResourceThreadPool;
 use net::test::HttpState;
@@ -89,6 +89,7 @@ fn new_fetch_context(
     fc: Option<EmbedderProxy>,
     pool_handle: Option<Weak<CoreResourceThreadPool>>,
     file_impl: Option<FileImpl>,
+    range: Option<RangeRequestBounds>,
 ) -> FetchContext {
     let certs = resources::read_string(Resource::SSLCertificates);
     let tls_config = create_tls_config(&certs, ALPN_H2_H1);
@@ -96,7 +97,7 @@ fn new_fetch_context(
 
     let filemanager = FileManager::new(sender, pool_handle.unwrap_or_else(|| Weak::new()));
 
-    let filemanager = FileManagerHandle::new(filemanager, file_impl);
+    let filemanager = FileManagerHandle::new(filemanager, file_impl, range);
 
     FetchContext {
         state: Arc::new(HttpState::new(tls_config)),
@@ -121,7 +122,7 @@ impl FetchTaskTarget for FetchResponseCollector {
 }
 
 fn fetch(request: &mut Request, dc: Option<Sender<DevtoolsControlMsg>>) -> Response {
-    fetch_with_context(request, &mut new_fetch_context(dc, None, None, None))
+    fetch_with_context(request, &mut new_fetch_context(dc, None, None, None, None))
 }
 
 fn fetch_with_context(request: &mut Request, mut context: &mut FetchContext) -> Response {
@@ -141,7 +142,7 @@ fn fetch_with_cors_cache(request: &mut Request, cache: &mut CorsCache) -> Respon
         request,
         cache,
         &mut target,
-        &mut new_fetch_context(None, None, None, None),
+        &mut new_fetch_context(None, None, None, None, None),
     );
 
     receiver.recv().unwrap()

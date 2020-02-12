@@ -8,8 +8,8 @@ use crate::connector::{create_http_client, create_tls_config, ALPN_H2_H1};
 use crate::cookie;
 use crate::cookie_storage::CookieStorage;
 use crate::fetch::cors_cache::CorsCache;
-use crate::fetch::methods::{fetch, CancellationListener, FetchContext};
-use crate::filemanager_thread::{FileManager, FileManagerHandle};
+use crate::fetch::methods::{fetch, CancellationListener, FetchContext, RangeRequestBounds};
+use crate::filemanager_thread::{FileImpl, FileManager, FileManagerHandle};
 use crate::hsts::HstsList;
 use crate::http_cache::HttpCache;
 use crate::http_loader::{http_redirect_fetch, HttpState, HANDLE};
@@ -23,6 +23,7 @@ use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcReceiver, IpcReceiverSet, IpcSender};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use net_traits::blob_url_store::parse_blob_url;
+use net_traits::filemanager_thread::RelativePos;
 use net_traits::request::{Destination, RequestBuilder};
 use net_traits::response::{Response, ResponseInit};
 use net_traits::storage_thread::StorageThreadMsg;
@@ -564,12 +565,31 @@ impl CoreResourceManager {
             _ => None,
         };
 
-        let file_impl = match file_impl_id {
-            Some((id, origin)) => filemanager.get_file(&id, &origin),
+        let file_impl = match file_impl_id.as_ref() {
+            Some((id, origin)) => filemanager.get_file(id, origin),
             None => None,
         };
 
-        let filemanager_handle = FileManagerHandle::new(filemanager, file_impl);
+        let (file_impl, range) = match file_impl {
+            None => (None, None),
+            Some(FileImpl::Sliced(parent_id, inner_rel_pos)) => {
+                let origin = file_impl_id
+                    .expect("Sliced file-impl doesn't have an id.")
+                    .1;
+                match filemanager.get_file(&parent_id, &origin) {
+                    None => (None, None),
+                    Some(parent) => {
+                        let range = RangeRequestBounds::Final(
+                            RelativePos::full_range().slice_inner(&inner_rel_pos),
+                        );
+                        (Some(parent), Some(range))
+                    },
+                }
+            },
+            Some(file) => (Some(file), None),
+        };
+
+        let filemanager_handle = FileManagerHandle::new(filemanager, file_impl, range);
 
         let thread_pool = match self.thread_pool.as_ref() {
             None => panic!("CoreResourceManager doesn't have a thread-pool."),

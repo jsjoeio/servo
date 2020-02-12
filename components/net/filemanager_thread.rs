@@ -72,13 +72,19 @@ pub struct FileManagerHandle {
     filemanager: FileManager,
     /// Set to a file-impl when fetching a Blob url.
     file_impl: Option<FileImpl>,
+    range: Option<RangeRequestBounds>,
 }
 
 impl FileManagerHandle {
-    pub fn new(filemanager: FileManager, file_impl: Option<FileImpl>) -> FileManagerHandle {
+    pub fn new(
+        filemanager: FileManager,
+        file_impl: Option<FileImpl>,
+        range: Option<RangeRequestBounds>,
+    ) -> FileManagerHandle {
         FileManagerHandle {
             filemanager,
             file_impl,
+            range,
         }
     }
 
@@ -122,6 +128,10 @@ impl FileManagerHandle {
         range: RangeRequestBounds,
         response: &mut Response,
     ) -> Result<(), BlobURLStoreError> {
+        let range = match self.range.take() {
+            Some(inner_range) => inner_range,
+            None => range,
+        };
         match self.file_impl.take() {
             Some(FileImpl::Memory(buf)) => {
                 let range = match range.get_final(Some(buf.size)) {
@@ -198,9 +208,10 @@ impl FileManagerHandle {
 
                 Ok(())
             },
-            Some(FileImpl::Sliced(_, _)) | None => {
-                panic!("Attempt to use FileManagerHandle with sliced, or non-existent, file-impl.")
+            Some(FileImpl::Sliced(_, _)) => {
+                panic!("Attempt to use FileManagerHandle with sliced file-impl.")
             },
+            None => Ok(()),
         }
     }
 }

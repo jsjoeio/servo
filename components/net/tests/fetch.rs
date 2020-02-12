@@ -167,7 +167,7 @@ fn test_fetch_blob() {
 
     let id = Uuid::new_v4();
 
-    let mut context = new_fetch_context(None, None, None, Some(FileImpl::Memory(blob_buf)));
+    let mut context = new_fetch_context(None, None, None, Some(FileImpl::Memory(blob_buf)), None);
 
     let url = ServoUrl::parse(&format!("blob:{}{}", origin.as_str(), id.to_simple())).unwrap();
 
@@ -216,7 +216,7 @@ fn test_file() {
 
     let pool = CoreResourceThreadPool::new();
     let pool_handle = Arc::new(pool);
-    let mut context = new_fetch_context(None, None, Some(Arc::downgrade(&pool_handle)), None);
+    let mut context = new_fetch_context(None, None, Some(Arc::downgrade(&pool_handle)), None, None);
     let fetch_response = fetch_with_context(&mut request, &mut context);
 
     // We should see an opaque-filtered response.
@@ -683,6 +683,7 @@ fn test_fetch_with_hsts() {
         filemanager: FileManagerHandle::new(
             FileManager::new(create_embedder_proxy(), Weak::new()),
             None,
+            None,
         ),
         cancellation_listener: Arc::new(Mutex::new(CancellationListener::new(None))),
         timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
@@ -737,6 +738,7 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         devtools_chan: None,
         filemanager: FileManagerHandle::new(
             FileManager::new(create_embedder_proxy(), Weak::new()),
+            None,
             None,
         ),
         cancellation_listener: Arc::new(Mutex::new(CancellationListener::new(None))),
